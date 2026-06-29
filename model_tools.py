@@ -34,6 +34,10 @@ from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
+# Tracks platform-bundle names already flagged in disabled_toolsets so the
+# advisory (#33924) is logged once per name, not on every tool recompute.
+_WARNED_DISABLED_BUNDLES: set = set()
+
 
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
@@ -221,7 +225,6 @@ _LEGACY_TOOLSET_MAP = {
     "web_tools": ["web_search", "web_extract"],
     "terminal_tools": ["terminal"],
     "vision_tools": ["vision_analyze"],
-    "moa_tools": ["mixture_of_agents"],
     "image_tools": ["image_generate"],
     "skills_tools": ["skills_list", "skill_view", "skill_manage"],
     "browser_tools": [
@@ -252,6 +255,14 @@ _LEGACY_TOOLSET_MAP = {
 # inner check_fn TTL cache in registry.py handles environment drift (Docker
 # daemon start/stop, env var changes, etc.) on a 30 s horizon.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
+
+# Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
+# process sees many distinct toolset/config fingerprints over its lifetime
+# (per-session toolset sets, config edits, kanban-task toggles); without a
+# bound the cache grows unboundedly. 8 comfortably covers the warm working
+# set (the handful of distinct platform/toolset combos a gateway actually
+# serves) while keeping the cap small. (#19251)
+_TOOL_DEFS_CACHE_MAX = 8
 
 
 def _clear_tool_defs_cache() -> None:
@@ -329,6 +340,11 @@ def get_tool_definitions(
         # agent inits and providers that enforce unique tool names
         # (DeepSeek, Xiaomi MiMo, Moonshot Kimi) reject the request with
         # HTTP 400. Mirrors the cache-hit path above. (issue #17335)
+        # Bound the cache with LRU eviction so a long-lived Gateway process
+        # doesn't accumulate entries unboundedly across the many distinct
+        # toolset/config fingerprints it sees over its lifetime (#19251).
+        if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
+            _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
         _tool_defs_cache[cache_key] = result
         return list(result)
     return result
@@ -379,8 +395,29 @@ def _compute_tool_definitions(
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
             if validate_toolset(toolset_name):
-                resolved = resolve_toolset(toolset_name)
-                tools_to_include.difference_update(resolved)
+                if toolset_name.startswith("hermes-"):
+                    # Platform bundles (hermes-*) include _HERMES_CORE_TOOLS, so
+                    # subtracting the whole bundle would strip core tools shared
+                    # by other enabled toolsets and empty the tool list (#33924).
+                    # Subtract only the bundle's non-core delta; keep core.
+                    from toolsets import bundle_non_core_tools
+                    to_remove = bundle_non_core_tools(toolset_name)
+                    tools_to_include.difference_update(to_remove)
+                    resolved = sorted(to_remove)
+                    if not quiet_mode and toolset_name not in _WARNED_DISABLED_BUNDLES:
+                        _WARNED_DISABLED_BUNDLES.add(toolset_name)
+                        logger.info(
+                            "agent.disabled_toolsets contains platform-bundle "
+                            "name '%s'; core tools are preserved and only its "
+                            "platform-specific tools (%s) are removed. Bundle "
+                            "names usually belong in `toolsets:`, not "
+                            "`disabled_toolsets` (#33924).",
+                            toolset_name,
+                            ", ".join(resolved) if resolved else "none",
+                        )
+                else:
+                    resolved = resolve_toolset(toolset_name)
+                    tools_to_include.difference_update(resolved)
                 if not quiet_mode:
                     print(f"🚫 Disabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")
             elif toolset_name in _LEGACY_TOOLSET_MAP:
@@ -1102,6 +1139,7 @@ def handle_function_call(
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
+                        session_id=session_id,
                         enabled_tools=sandbox_enabled,
                     )
             else:
@@ -1109,6 +1147,7 @@ def handle_function_call(
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
+                        session_id=session_id,
                         user_task=user_task,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
