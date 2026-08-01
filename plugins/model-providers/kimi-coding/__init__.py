@@ -86,9 +86,12 @@ class KimiProfile(ProviderProfile):
 
         # Enabled: prefer an explicit effort; only fall back to extra_body
         # thinking when no recognized effort is requested.
+        # K3 supports low/high/max (default max); xhigh/ultra clamp to max.
         effort = (reasoning_config.get("effort") or "").strip().lower()
-        if effort in {"low", "medium", "high"}:
+        if effort in {"low", "medium", "high", "max"}:
             top_level["reasoning_effort"] = effort
+        elif effort in {"xhigh", "ultra"}:
+            top_level["reasoning_effort"] = "max"
         else:
             extra_body["thinking"] = {"type": "enabled"}
 
