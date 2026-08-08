@@ -141,6 +141,27 @@ def _resolve_xai_bearer() -> Tuple[str, str, str]:
     return api_key, base_url, source
 
 
+def _resolve_xai_api_key_fallback() -> Optional[Tuple[str, str, str]]:
+    """Resolve the standalone ``XAI_API_KEY`` as a fallback credential path.
+
+    Returns ``(api_key, base_url, "xai")`` when the env key exists, else
+    ``None``. Used when the OAuth path fails at request time (e.g. a
+    SuperGrok subscription with exhausted quota returns spending-limit
+    errors even though its token resolves fine) — patched 2026-08-02.
+    """
+    try:
+        from hermes_cli.config import get_env_value
+        api_key = str(get_env_value("XAI_API_KEY") or "").strip()
+        if not api_key:
+            return None
+        base_url = str(
+            get_env_value("XAI_BASE_URL") or "https://api.x.ai/v1"
+        ).strip().rstrip("/")
+        return api_key, base_url, "xai"
+    except Exception:
+        return None
+
+
 def check_x_search_requirements() -> bool:
     """Return True when xAI credentials are available AND valid.
 
@@ -352,6 +373,7 @@ def x_search_tool(
         timeout_seconds = _get_x_search_timeout_seconds()
         max_retries = _get_x_search_retries()
         response: Optional[requests.Response] = None
+        _oauth_fallback_used = False
         for attempt in range(max_retries + 1):
             try:
                 response = requests.post(
@@ -368,6 +390,25 @@ def x_search_tool(
                 break
             except requests.HTTPError as e:
                 status_code = getattr(getattr(e, "response", None), "status_code", None)
+                # OAuth 优先，但 SuperGrok 额度用尽时（spending-limit / 401 /
+                # 4xx）fallback 到独立 XAI_API_KEY 重试一次（patched 2026-08-02）。
+                if (
+                    source == "xai-oauth"
+                    and not _oauth_fallback_used
+                    and status_code is not None
+                    and status_code < 500
+                ):
+                    fallback = _resolve_xai_api_key_fallback()
+                    if fallback:
+                        api_key, base_url, source = fallback
+                        _oauth_fallback_used = True
+                        logger.warning(
+                            "x_search OAuth failed (HTTP %s), falling back to "
+                            "XAI_API_KEY: %s",
+                            status_code,
+                            _http_error_message(e),
+                        )
+                        continue
                 if status_code is None or status_code < 500 or attempt >= max_retries:
                     raise
                 logger.warning(

@@ -15857,7 +15857,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # real token counts.  Having hygiene at 0.50 caused premature
             # compression on every turn in long gateway sessions.
             _hyg_model = "anthropic/claude-sonnet-4.6"
-            _hyg_threshold_pct = 0.85
+            # 2026-08-07 local patch: 0.85 -> 0.95 to use the full 1M context.
+            # Agent-side compression runs at 0.85 (config), so hygiene at 0.95
+            # only fires as a safety net when agent compression failed. Warn at
+            # 0.98 to stay clear of the provider hard limit. RE-APPLY after any
+            # upstream upgrade (same as the context_compressor constants patch).
+            _hyg_threshold_pct = 0.95
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 5000
             _hyg_timeout_seconds = 30.0
@@ -16008,7 +16013,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _compress_token_threshold = int(
                     _hyg_context_length * _hyg_threshold_pct
                 )
-                _warn_token_threshold = int(_hyg_context_length * 0.95)
+                _warn_token_threshold = int(_hyg_context_length * 0.98)
 
                 _msg_count = len(history)
 

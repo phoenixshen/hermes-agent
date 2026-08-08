@@ -364,11 +364,19 @@ _RESTART_HANDOFF_PROBE_EXTRA_MESSAGES = 4
 # Minimum tokens for the summary output
 _MIN_SUMMARY_TOKENS = 2000
 # Proportion of compressed content to allocate for summary
-_SUMMARY_RATIO = 0.20
+# 2026-08-01 benchmark: 0.20 forces long-output mode (TTFT 40.9s, 20K reasoning,
+# less output); 0.08 -> TTFT 4.0s, more output. Patch re-applied 2026-08-07
+# after upstream upgrade dropped it.
+# 2026-08-07 v2: 0.08 -> 0.12 for higher density (85K budget @ 700K context,
+# capped by ceiling). Stays well below the 0.20 long-output-mode cliff.
+_SUMMARY_RATIO = 0.12
 # Absolute ceiling for summary tokens (even on very large context windows).
 # Summaries must stay within a 1K-10K token envelope — anything larger is
 # itself a context-pressure source and slows every compaction.
-_SUMMARY_TOKENS_CEILING = 10_000
+# 2026-08-01 benchmark: 4000 target beats 10000 (8.8s vs 43.6s, more content).
+# 2026-08-07 v2: 4000 -> 6000 for +50% density; 10000 measured to trigger
+# long-output mode (TTFT 40.9s). 6000 is the conservative midpoint.
+_SUMMARY_TOKENS_CEILING = 6_000
 
 # Micro-compaction failure guard: after this many consecutive failures on the
 # same cursor position, skip the stuck exchange and advance the cursor so the
