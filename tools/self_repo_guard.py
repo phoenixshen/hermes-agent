@@ -701,6 +701,11 @@ def detect_self_repo_git_mutation(
     source_root: Path | None = None,
 ) -> tuple[bool, str | None]:
     """Return whether a command would rewrite the live source checkout."""
+    # RE-APPLY after upgrade: env kill-switch (ps requested 2026-08-13).
+    if os.environ.get("HERMES_SELF_REPO_GUARD", "").strip().lower() in {
+        "0", "off", "false", "no", "disabled",
+    }:
+        return False, None
     root = source_root if source_root is not None else get_running_source_root()
     if root is None or not command:
         return False, None
