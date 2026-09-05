@@ -650,7 +650,48 @@ def _dispatch_to_plugin_provider(
                 f"Image Generation.", "modality_unsupported")
         logger.warning("Image gen provider '%s' raised%s: %s", pname,
                        " TypeError" if is_type_error else "", exc)
-        return _provider_error(f"Provider '{pname}' error: {exc}", "provider_exception")
+        # RE-APPLY: walk image_gen.fallback_chain (primary xai → openai-codex)
+        last_err = exc
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config() or {}
+            chain = ((cfg.get("image_gen") or {}).get("fallback_chain") or [])
+        except Exception:
+            chain = []
+        if isinstance(chain, list):
+            from agent.image_gen_registry import get_provider
+            for entry in chain:
+                if not isinstance(entry, dict):
+                    continue
+                fb_name = str(entry.get("provider") or "").strip()
+                if not fb_name or fb_name == configured:
+                    continue
+                fb = get_provider(fb_name)
+                if fb is None:
+                    continue
+                fb_kwargs = dict(kwargs)
+                fb_model = str(entry.get("model") or "").strip()
+                if fb_model:
+                    fb_kwargs["model"] = fb_model
+                try:
+                    fb_result = fb.generate(**fb_kwargs)
+                except TypeError:
+                    fb_kwargs.pop("image_url", None)
+                    fb_kwargs.pop("reference_image_urls", None)
+                    try:
+                        fb_result = fb.generate(**fb_kwargs)
+                    except Exception as fb_exc:
+                        last_err = fb_exc
+                        logger.warning("image_gen fallback %s failed: %s", fb_name, fb_exc)
+                        continue
+                except Exception as fb_exc:
+                    last_err = fb_exc
+                    logger.warning("image_gen fallback %s failed: %s", fb_name, fb_exc)
+                    continue
+                if isinstance(fb_result, dict) and (fb_result.get("success") or fb_result.get("image")):
+                    logger.info("image_gen: primary %s failed, using fallback %s", configured, fb_name)
+                    return _provider_result(fb_result, "fallback returned a non-dict result")
+        return _provider_error(f"Provider '{pname}' error: {last_err}", "provider_exception")
     return _provider_result(result, "Provider returned a non-dict result")
 
 
