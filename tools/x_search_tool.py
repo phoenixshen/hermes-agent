@@ -103,21 +103,6 @@ def _resolve_xai_api_key_fallback() -> Optional[Tuple[str, str, str]]:
         return None
 
 
-def _resolve_xai_oauth_fallback() -> Optional[Tuple[str, str, str]]:
-    """SuperGrok OAuth when the paid key 401/403s. RE-APPLY after upgrade."""
-    try:
-        creds = resolve_xai_http_credentials(prefer_api_key=False)
-        if str(creds.get("provider") or "") != "xai-oauth":
-            return None
-        api_key = str(creds.get("api_key") or "").strip()
-        if not api_key:
-            return None
-        base_url = str(creds.get("base_url") or DEFAULT_XAI_BASE_URL).strip().rstrip("/")
-        return api_key, base_url, "xai-oauth"
-    except Exception:
-        return None
-
-
 def check_x_search_requirements() -> bool:
     """True when xAI credentials resolve to a non-empty bearer (OAuth auto-refreshed)."""
     return bool(str(resolve_xai_http_credentials().get("api_key") or "").strip())
@@ -322,23 +307,6 @@ def x_search_tool(
                         logger.warning(
                             "x_search OAuth failed (HTTP %s), falling back to "
                             "XAI_API_KEY: %s",
-                            status_code,
-                            _http_error_message(e),
-                        )
-                        continue
-                # RE-APPLY: paid key spending-limit must not skip live SuperGrok.
-                if (
-                    source == "xai"
-                    and not _oauth_fallback_used
-                    and status_code in (401, 403)
-                ):
-                    fallback = _resolve_xai_oauth_fallback()
-                    if fallback and fallback[0] != api_key:
-                        api_key, base_url, source = fallback
-                        _oauth_fallback_used = True
-                        logger.warning(
-                            "x_search API key failed (HTTP %s), falling back to "
-                            "xai-oauth: %s",
                             status_code,
                             _http_error_message(e),
                         )
