@@ -2,8 +2,9 @@
 """X Search tool backed by xAI's built-in ``x_search`` Responses API tool.
 
 Registers when either xAI credential path is available (``XAI_API_KEY`` or ``hermes auth add
-xai-oauth``). At call time an explicit ``XAI_API_KEY`` wins (``prefer_api_key=True``): x_search
-is API-metered and the subscription OAuth bearer answers ``/v1/responses`` without citations.
+xai-oauth``). Call time prefers SuperGrok OAuth (``prefer_api_key=False``): paid ``XAI_API_KEY``
+is often spending-limited while OAuth still returns real ``x.com`` citations.
+# RE-APPLY after upgrade: upstream #88040 still sets prefer_api_key=True.
 Date filters are validated client-side so malformed windows fail fast instead of burning a
 billable call. Results carry ``degraded``: True when a narrowing filter was active AND xAI
 returned no citations in either channel (answer came from model knowledge, not the X index).
@@ -55,17 +56,22 @@ def _get_x_search_int(key: str, default: int, floor: int) -> int:
         return default
 
 
+def _get_x_search_timeout_seconds() -> int:
+    return _get_x_search_int("timeout_seconds", DEFAULT_X_SEARCH_TIMEOUT_SECONDS, 30)
+
+
+def _get_x_search_retries() -> int:
+    return _get_x_search_int("retries", DEFAULT_X_SEARCH_RETRIES, 0)
+
+
 def _resolve_xai_bearer() -> Tuple[str, str, str]:
     """Return ``(api_key, base_url, source)``; ``source`` is ``"xai-oauth"`` or ``"xai"``. Raises RuntimeError
     when no credential is usable (expiry between registration and call -> clean tool error, not a 401).
 
-    x_search is API-index access: when a subscription OAuth credential is configured alongside a paid
-    ``XAI_API_KEY``, the OAuth path authorizes but answers ``/v1/responses`` in a degraded Grok explanatory
-    mode with no citations, while the API key returns real posts (#88040). Pass ``prefer_api_key=True`` so
-    the shared resolver checks the explicit API key first — same root cause as the TTS fix for #87045
-    (#87081) — keeping OAuth as the fallback when no API key is configured.
+    SuperGrok OAuth first. Paid ``XAI_API_KEY`` is fallback only (key 403 spending-limit must
+    not hide a live subscription). RE-APPLY after upgrade: upstream #88040 still prefers the key.
     """
-    creds = resolve_xai_http_credentials(prefer_api_key=True)
+    creds = resolve_xai_http_credentials(prefer_api_key=False)
     api_key = str(creds.get("api_key") or "").strip()
     if not api_key:
         raise RuntimeError(
@@ -97,12 +103,24 @@ def _resolve_xai_api_key_fallback() -> Optional[Tuple[str, str, str]]:
         return None
 
 
+def _resolve_xai_oauth_fallback() -> Optional[Tuple[str, str, str]]:
+    """SuperGrok OAuth when the paid key 401/403s. RE-APPLY after upgrade."""
+    try:
+        creds = resolve_xai_http_credentials(prefer_api_key=False)
+        if str(creds.get("provider") or "") != "xai-oauth":
+            return None
+        api_key = str(creds.get("api_key") or "").strip()
+        if not api_key:
+            return None
+        base_url = str(creds.get("base_url") or DEFAULT_XAI_BASE_URL).strip().rstrip("/")
+        return api_key, base_url, "xai-oauth"
+    except Exception:
+        return None
+
+
 def check_x_search_requirements() -> bool:
     """True when xAI credentials resolve to a non-empty bearer (OAuth auto-refreshed)."""
-    try:
-        return bool(str(resolve_xai_http_credentials().get("api_key") or "").strip())
-    except Exception:
-        return False
+    return bool(str(resolve_xai_http_credentials().get("api_key") or "").strip())
 
 
 def _normalize_handles(handles: Optional[List[str]], field_name: str) -> List[str]:
@@ -304,6 +322,23 @@ def x_search_tool(
                         logger.warning(
                             "x_search OAuth failed (HTTP %s), falling back to "
                             "XAI_API_KEY: %s",
+                            status_code,
+                            _http_error_message(e),
+                        )
+                        continue
+                # RE-APPLY: paid key spending-limit must not skip live SuperGrok.
+                if (
+                    source == "xai"
+                    and not _oauth_fallback_used
+                    and status_code in (401, 403)
+                ):
+                    fallback = _resolve_xai_oauth_fallback()
+                    if fallback and fallback[0] != api_key:
+                        api_key, base_url, source = fallback
+                        _oauth_fallback_used = True
+                        logger.warning(
+                            "x_search API key failed (HTTP %s), falling back to "
+                            "xai-oauth: %s",
                             status_code,
                             _http_error_message(e),
                         )
