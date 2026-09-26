@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agent.image_eviction_policy import outbound_image_retire_count
+from agent.compression_marker import _COMPRESSION_MARKER_PREFIX, _COMPRESSION_MARKER_TEMPLATE
 from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
     _coerce_llm_message,
@@ -298,6 +299,9 @@ COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 # Only micro markers may be superseded/defragged/rehydrated: a batch marker's
 # content is NOT in the rolling micro summary, so rewriting one destroys history.
 MICRO_COMPACT_MARKER_KEY = "_micro_compact_marker"
+# ``display_metadata`` flag on a row the model reads but nobody typed as one message (micro-compaction's
+# merge of adjacent user turns). Its source rows stay in display history, so display projections skip it.
+MODEL_ONLY_DISPLAY_METADATA_KEY = "model_only"
 # Intrinsic marker stamped on a message dict once it has been written to the SQLite session store. Used by
 # ``_flush_messages_to_session_db`` to decide what is already durable. An object-identity (``id(msg)``)
 # dedup set cannot be trusted across turns: once a flushed message dict is dropped from the live list (e.g.
@@ -376,6 +380,43 @@ def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
     for msg in messages:
         if isinstance(msg, dict):
             msg.pop(_DB_PERSISTED_MARKER, None)
+
+
+class StaleHeldHistory(RuntimeError):
+    """The history a lease-less rewrite holds is no longer the session's live generation.
+
+    Its newest exact row is inactive: another compaction already committed (a ``/compress`` on this or
+    another surface, or an earlier prune/micro pass). Published anyway, the stale rewrite would archive the
+    winner's rows under the lease-less watermark and clone them back as a "concurrent tail" — two summary
+    generations live. Prune and micro-compaction hold no compression lease, so they abort on this instead.
+    """
+
+
+def _archive_watermark_for(session_db: Any, session_id: str, held: List[Dict[str, Any]],
+                           start_watermark: Optional[int] = None) -> Optional[int]:
+    """The archive watermark for a commit that rewrites the history this process holds.
+
+    Without one, ``archive_and_compact`` archives every active row, including turns another surface appended
+    to the same session since this process loaded it (a Desktop session continued from Telegram) and rows
+    that arrived while the commit was being built. Those never reached this process, so they would be marked
+    summarized away with no summary holding them: still displayed and searchable, but gone from the model's
+    history. Capping at the newest row the process held sends them down the
+    concurrent-append path instead (cloned after the new set), the same rule the in-place compaction commit
+    applies. *start_watermark* is the store's watermark from before any slow step; it defaults to now.
+    A store without the watermark API keeps today's archive-everything commit.
+
+    Raises :class:`StaleHeldHistory` when the newest held exact row is no longer active. The in-place commit
+    falls back to the lease watermark there because its lease rules out an overlapping compaction; prune and
+    micro-compaction hold no lease, so for them that fallback would publish a stale generation beside the one
+    that won.
+    """
+    watermark_of = getattr(session_db, "get_active_message_watermark", None)
+    if not callable(watermark_of) or not callable(getattr(session_db, "get_message_role", None)):
+        return None
+    if start_watermark is None:
+        start_watermark = watermark_of(session_id)
+    from agent.conversation_compression import held_archive_watermark
+    return held_archive_watermark(session_db, session_id, start_watermark, held, stale_raises=True)
 
 
 def stamp_db_persisted_markers(messages: List[Dict[str, Any]]) -> None:
@@ -768,6 +809,18 @@ _TERMINAL_SUMMARY_FAILURES = (
 # unchanged route and prompt, so a flat 30s cooldown let every async-completion turn re-issue the same
 # capped request after its per-turn attempt budget was refilled (#69637).
 _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
+
+# Sustained-overload escalation (#123167): ONE overload aborts so a later retry can still win (#115906),
+# but if every summary attempt keeps aborting the transcript only grows until the session exits
+# compression_exhausted and the gateway auto-resets — bounded middle-window loss becomes a total
+# session wipe, just deferred. After this many consecutive overload aborts in one session the overload
+# stops counting as terminal and compress() commits the deterministic fallback instead — the same
+# bounded degrade the repeated-stall ladder takes (#112420). abort_on_summary_failure=true still
+# hard-aborts every attempt. The streak is durable per session (the gateway binds a fresh compressor on
+# every turn / cache eviction, so a memory-only budget restarted at zero); a successful summary, a
+# completed boundary (incl. the degraded fallback, else recovery stays degraded) or a runtime switch
+# resets it.
+_CONSECUTIVE_OVERLOAD_ABORT_ESCALATION = 3
 
 
 def _next_timeout_cooldown(compressor: Any, counter: str = "_consecutive_timeout_failures") -> int:
@@ -1487,20 +1540,6 @@ def evict_stale_outbound_tool_images(api_messages: List[Dict[str, Any]]) -> int:
     return pruned
 
 
-# #83714 — this text lands inside the model's OWN replayed tool call, so it must not read like
-# something the model would write itself: the bare "...[truncated]" it replaced was imitated into
-# new calls and written to disk. Non-prose delimiters, an explicit "not original content"
-# disclaimer, and per-instance counts keep a copied marker visibly wrong; the counts also make a
-# verbatim copy stale, which is why the marker must never be re-applied (see ``_shrink``).
-_COMPRESSION_MARKER_PREFIX = "⟪HERMES-CONTEXT-COMPRESSION:"
-_COMPRESSION_MARKER_TEMPLATE = (
-    _COMPRESSION_MARKER_PREFIX
-    + " {omitted:,} of {total:,} chars omitted here by Hermes's context compressor. "
-    "This is NOT part of the original tool call and must never be reproduced in new "
-    "output — always write full, untruncated content.⟫"
-)
-
-
 def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     """Shrink long string leaves in a tool-call arguments JSON blob, keeping it valid (providers 400 on malformed args).
 
@@ -2189,6 +2228,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # named in the user-visible warning and falls back to the main model (#116472).
         self._last_aux_resolved_model = None
         self._consecutive_timeout_failures = self._consecutive_truncation_failures = 0
+        # Sustained-overload escalation bookkeeping (#123167): per-session, reset by success.
+        self._consecutive_overload_aborts = 0
+        self._last_summary_overload_degraded = False
         # Turns unrecoverably dropped by a static fallback, so callers can warn.
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = self._last_feasibility_skip = False
@@ -2224,6 +2266,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._cooldown_persist_failed = False
         self._last_summary_error = None
         self._consecutive_timeout_failures = self._consecutive_truncation_failures = self._fallback_compression_streak = 0
+        self._consecutive_overload_aborts = 0
         self._ineffective_compression_count = self._prellm_skip_count = 0
         self._anti_thrash_recovery_deadline = self._structural_no_op_backoff_until = 0.0
         self._reset_proactive_prune_rearm()
@@ -2231,6 +2274,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
         self._load_anti_thrash_recovery_deadline()
+        self._load_consecutive_overload_aborts()
         self._load_proactive_prune_rearm_tokens()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
@@ -2241,6 +2285,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         session_db = kwargs.get("session_db", getattr(self, "_session_db", None))
         previous_fallback_streak = self._fallback_compression_streak
         previous_ineffective_count = self._ineffective_compression_count
+        previous_overload_aborts = self._consecutive_overload_aborts
         if boundary_reason == "compression" and old_session_id:
             # Parent row carries the streak/strike state across the rotation.
             def _parent(method: str, label: str, current: int) -> int:
@@ -2253,6 +2298,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             previous_ineffective_count = _parent(
                 "get_compression_ineffective_count", "compression parent ineffective count", previous_ineffective_count,
             )
+            previous_overload_aborts = _parent(
+                "get_compression_overload_streak", "compression parent overload streak", previous_overload_aborts,
+            )
         self.bind_session_state(session_db, session_id)
         if boundary_reason == "compression":
             # Rotation creates a fresh child row first; carry the streak until boundary bookkeeping persists it.
@@ -2261,6 +2309,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             if self._ineffective_compression_count != previous_ineffective_count:
                 self._ineffective_compression_count = previous_ineffective_count
                 self._persist_ineffective_compression_count()
+            # Same for the sustained-overload budget: nothing else writes the child row at the boundary.
+            if self._consecutive_overload_aborts != previous_overload_aborts:
+                self._consecutive_overload_aborts = previous_overload_aborts
+                self._persist_consecutive_overload_aborts()
 
     def _durable_read(
         self, method: str, label: str, coerce, default, *args,
@@ -2321,6 +2373,34 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     def _persist_fallback_compression_streak(self) -> None:
         self._durable_write("set_compression_fallback_streak", "compression fallback streak", self._fallback_compression_streak)
+
+    def _load_consecutive_overload_aborts(self) -> None:
+        """Restore the sustained-overload budget so a fresh compressor bound to a resumed session
+        inherits it (#123167 review P1; same contract as the fallback streak, #100185)."""
+        self._load_durable("_consecutive_overload_aborts", "get_compression_overload_streak", "compression overload streak", int, 0)
+
+    def _persist_consecutive_overload_aborts(self) -> None:
+        self._durable_write("set_compression_overload_streak", "compression overload streak", self._consecutive_overload_aborts)
+
+    def _clear_terminal_summary_failures(self) -> None:
+        """Clear every terminal summary-failure flag."""
+        for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
+            setattr(self, flag, False)
+
+    def _reset_consecutive_overload_aborts(self) -> None:
+        """Zero the sustained-overload budget and ALWAYS write the row: the in-memory count is not
+        authoritative when two agents share a session, so skipping the write would let another
+        agent's streak survive a success or runtime switch."""
+        self._consecutive_overload_aborts = 0
+        self._persist_consecutive_overload_aborts()
+
+    def _increment_consecutive_overload_aborts(self) -> None:
+        """Count one overload abort. The bound row is bumped atomically and is authoritative, so two
+        agents on one session cannot lose a strike; memory-only when unbound or the row is missing."""
+        found, streak = self._durable_read(
+            "increment_compression_overload_streak", "compression overload streak increment", int, 0,
+        )
+        self._consecutive_overload_aborts = streak if found and streak else self._consecutive_overload_aborts + 1
 
     def _load_ineffective_compression_count(self) -> None:
         """Load the durable anti-thrash strike count so a restart never disarms a guard."""
@@ -2397,6 +2477,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         elif self._fallback_compression_streak:
             self._fallback_compression_streak = 0
         self._persist_fallback_compression_streak()
+        # Any completed boundary (incl. the degraded fallback) settles the overload budget (#123167).
+        self._reset_consecutive_overload_aborts()
 
     def get_active_compression_failure_cooldown(self, *, refresh: bool = False) -> Optional[Dict[str, Any]]:
         """Return the live compression-failure cooldown for the bound session."""
@@ -2563,6 +2645,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             self._persist_fallback_compression_streak()
             # Cooldowns are scoped to the failed model/provider; a switch gets an immediate attempt.
             self._clear_compression_failure_cooldown()
+            # The overload budget rode those cooldowns; a new runtime restarts it too.
+            self._reset_consecutive_overload_aborts()
         self._verify_compaction_cleared_threshold = self._last_compression_made_progress = False
         # Runway was computed against the previous model's trigger; clear the durable copy too.
         self._reset_proactive_prune_rearm()
@@ -2742,8 +2826,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._reset_session_compaction_state()
         # Terminal summary failures (access/quota, network, empty content, finish_reason=length): compress()
         # must ABORT and preserve the session regardless of abort_on_summary_failure (see _TERMINAL_SUMMARY_FAILURES).
-        for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
-            setattr(self, flag, False)
+        self._clear_terminal_summary_failures()
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -3280,10 +3363,20 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         next_rearm_tokens = after + runway
         if session_db and session_id:
             try:
+                from agent.conversation_compression_archive import coverage_for_commit
+                covered_ids, unresolved_held = coverage_for_commit(session_db, session_id, messages)
                 session_db.archive_and_compact(
                     session_id, pruned_msgs,
                     model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens},
+                    watermark=_archive_watermark_for(session_db, session_id, messages),
+                    covered_ids=covered_ids, unresolved_held=unresolved_held,
                 )
+            except StaleHeldHistory:
+                # Another compaction already committed this session's history; a lease-less prune of the
+                # generation this process holds would publish beside the winner. Leave the input alone.
+                logger.info("Proactive tool-result prune skipped: another compaction already committed this session")
+                self._warn_reclamation_no_op("prune:stale_generation", current_tokens, before=before)
+                return messages, 0
             except Exception as exc:
                 logger.warning("Proactive tool-result prune DB commit failed; keeping the original transcript: %s", exc)
                 return messages, 0
@@ -3876,8 +3969,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             self._clear_compression_failure_cooldown()
             self._summary_model_fallen_back = False
             self._last_summary_error = None
-            for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
-                setattr(self, flag, False)
+            self._clear_terminal_summary_failures()
+            # The provider answered a summary again: the sustained-overload budget restarts (#123167).
+            self._reset_consecutive_overload_aborts()
             return self._with_summary_prefix(summary)
         except Exception as e:
             return self._on_summary_failure(e, turns_to_summarize, focus_topic, memory_context)
@@ -4042,9 +4136,10 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
             return None
         kind = _classify_summary_failure(e)
+        access_error = _is_summary_access_or_quota_error(e)
         # Auth/permission/quota failures are not retryable: flag so compress() preserves the
         # session. A distinct summary_model still gets the one-shot main-model fallback.
-        if _is_summary_access_or_quota_error(e):
+        if access_error:
             # Field name kept for caller compatibility; now covers the whole access/quota class.
             self._last_summary_auth_failure = True
         if kind.json_decode and not kind.model_not_found and not kind.timeout:
@@ -4091,8 +4186,19 @@ Write only the summary body. Do not include any preamble or prefix."""
             self._last_summary_truncated_failure = True
         elif kind.empty_content:
             self._last_summary_empty_content_failure = True
-        elif kind.overloaded:
-            self._last_summary_overload_failure = True
+        elif kind.overloaded and not access_error:
+            # A 403/402 that also says "overloaded" is an auth/quota abort (#29559), not an
+            # overload strike: counting it would let the next real 503 skip its grace (#115906).
+            self._increment_consecutive_overload_aborts()
+            # Sustained overload stops being terminal after N strikes (#123167; see the constant).
+            self._last_summary_overload_failure = (
+                self._consecutive_overload_aborts < _CONSECUTIVE_OVERLOAD_ABORT_ESCALATION
+            )
+            self._last_summary_overload_degraded = not self._last_summary_overload_failure
+            if self._last_summary_overload_degraded:
+                # The latest failure class decides: a stale network/empty/truncated/auth flag from
+                # an earlier failure (only a success clears those) must not keep aborting forever.
+                self._clear_terminal_summary_failures()
         logger.warning(
             "Failed to generate context summary: %s. Further summary attempts paused for %d seconds.", e,
             _transient_cooldown,
@@ -4169,13 +4275,15 @@ Write only the summary body. Do not include any preamble or prefix."""
         from agent.conversation_loop import (
             _CODEX_ACK_CONTINUATION_NUDGE, _CODEX_INCOMPLETE_NUDGE, _DEGENERATE_FINAL_NUDGE,
             _DROPPED_TOOLCALL_NUDGE_CONTENT, _EMPTY_TOOL_RESPONSE_NUDGE, _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
-            _LENGTH_CONTINUATION_NETWORK_STUB, _LENGTH_CONTINUATION_OUTPUT_LIMIT,
+            _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB, _LENGTH_CONTINUATION_NETWORK_STUB,
+            _LENGTH_CONTINUATION_OUTPUT_LIMIT,
         )
         return text in {
             COMPRESSION_CONTINUATION_USER_CONTENT, _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
             MAX_ITERATIONS_SUMMARY_REQUEST, _CODEX_INCOMPLETE_NUDGE, _CODEX_ACK_CONTINUATION_NUDGE,
             _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT, _EMPTY_TOOL_RESPONSE_NUDGE,
-            _LENGTH_CONTINUATION_NETWORK_STUB, _LENGTH_CONTINUATION_OUTPUT_LIMIT,
+            _LENGTH_CONTINUATION_NETWORK_STUB, _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB,
+            _LENGTH_CONTINUATION_OUTPUT_LIMIT,
         } or text.startswith((
             _BACKGROUND_PROCESS_NOTIFICATION_PREFIX, TODO_INJECTION_HEADER + "\n", _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
         ))
@@ -4968,6 +5076,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
         self._last_compress_refused_would_grow = False
+        self._last_summary_overload_degraded = False
         self._last_compression_made_progress = False
         # Do NOT reset the *_failure flags: the cooldown early-return doesn't re-assert them, so a
         # reset would fall through to the destructive static fallback (#29559). Success clears them.
@@ -5053,7 +5162,8 @@ Write only the summary body. Do not include any preamble or prefix."""
         self, telemetry: Dict[str, Any], n_skipped: int, previous_summary_before_scan: Optional[str],
     ) -> bool:
         """Abort (messages unchanged) on a terminal failure or when configured to; True when aborted.
-        Access/quota, network, truncated and empty-content failures ALWAYS abort (#29559); otherwise
+        Access/quota, network, truncated and empty-content failures ALWAYS abort (#29559); an overload
+        aborts only until the sustained-overload escalation (#123167); otherwise
         ``abort_on_summary_failure`` decides between abort and the static fallback."""
         terminal_failure = next(
             ((failure_class, message) for flag, failure_class, message in _TERMINAL_SUMMARY_FAILURES if getattr(self, flag)),
@@ -5113,8 +5223,9 @@ Write only the summary body. Do not include any preamble or prefix."""
         self._last_summary_fallback_used = True
         telemetry["fallback_used"] = True
         # Feasibility skip is deliberate, not aux-model breakage — keep the telemetry class distinct.
-        telemetry["failure_class"] = telemetry.get("failure_class") or (
-            "feasibility_skip" if feasibility_skip else "summary_generation_failed"
+        # An escalated overload outranks the aux->main retry's earlier aux_model_fallback label.
+        telemetry["failure_class"] = "summary_overload_degraded" if self._last_summary_overload_degraded else (
+            telemetry.get("failure_class") or ("feasibility_skip" if feasibility_skip else "summary_generation_failed")
         )
         return self._build_static_fallback_summary(
             turns_to_summarize,

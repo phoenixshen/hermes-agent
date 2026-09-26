@@ -26,14 +26,10 @@ _MODELS: Dict[str, Dict[str, Any]] = {
     "grok-imagine-image": {
         "display": "Grok Imagine Image", "speed": "~5-10s", "strengths": "Fast, high-quality",
     },
+    # Upstream now ships 2.0; keep this entry (RE-APPLY satisfied 2026-09-27).
     "grok-imagine-image-2.0": {
         "display": "Grok Imagine Image 2.0", "speed": "~10-20s",
         "strengths": "Typography/layout-aware; legible small text; strongest quality.",
-    },
-    "grok-imagine-image-2.0": {  # RE-APPLY after upgrade: xAI model list has 2.0 (2026-08-13)
-        "display": "Grok Imagine Image 2.0",
-        "speed": "~5-10s",
-        "strengths": "Next-generation image model",
     },
     "grok-imagine-image-quality": {
         "display": "Grok Imagine Image (Quality)", "speed": "~10-20s",

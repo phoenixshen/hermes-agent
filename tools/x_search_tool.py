@@ -276,7 +276,11 @@ def x_search_tool(
         max_retries = _get_x_search_retries()
         response: Optional[requests.Response] = None
         _oauth_fallback_used = False
-        for attempt in range(max_retries + 1):
+        attempt = 0
+        # +1 because range(max_retries+1) was the old budget. Fallback must not
+        # consume the last slot and then fall through with the failed response.
+        attempt_budget = max_retries + 1
+        while attempt < attempt_budget:
             try:
                 response = requests.post(
                     f"{base_url}/responses",
@@ -293,7 +297,7 @@ def x_search_tool(
             except requests.HTTPError as e:
                 status_code = getattr(getattr(e, "response", None), "status_code", None)
                 # OAuth 优先，但 SuperGrok 额度用尽时（spending-limit / 401 /
-                # 4xx）fallback 到独立 XAI_API_KEY 重试一次（patched 2026-08-02）。
+                # 4xx）fallback 到独立 XAI_API_KEY 再试一次（patched 2026-08-02）。
                 if (
                     source == "xai-oauth"
                     and not _oauth_fallback_used
@@ -304,34 +308,46 @@ def x_search_tool(
                     if fallback:
                         api_key, base_url, source = fallback
                         _oauth_fallback_used = True
+                        response = None
                         logger.warning(
                             "x_search OAuth failed (HTTP %s), falling back to "
                             "XAI_API_KEY: %s",
                             status_code,
                             _http_error_message(e),
                         )
+                        if attempt + 1 >= attempt_budget:
+                            attempt_budget += 1
+                        attempt += 1
                         continue
-                if status_code is None or status_code < 500 or attempt >= max_retries:
+                if status_code is None or status_code < 500 or attempt + 1 >= attempt_budget:
                     raise
                 logger.warning(
                     "x_search upstream failure on attempt %s/%s: %s",
                     attempt + 1,
-                    max_retries + 1,
+                    attempt_budget,
                     _http_error_message(e),
                 )
                 time.sleep(min(5.0, 1.5 * (attempt + 1)))
+                attempt += 1
             except (requests.ReadTimeout, requests.ConnectionError) as e:
-                if attempt >= max_retries:
+                if attempt + 1 >= attempt_budget:
                     raise
                 logger.warning(
                     "x_search transient failure on attempt %s/%s: %s",
                     attempt + 1,
-                    max_retries + 1,
+                    attempt_budget,
                     e,
                 )
                 time.sleep(min(5.0, 1.5 * (attempt + 1)))
+                attempt += 1
+        else:
+            if response is not None:
+                response.raise_for_status()
+            raise RuntimeError("x_search request did not return a response")
 
-        if response is None:
+        if response is None or not response.ok:
+            if response is not None:
+                response.raise_for_status()
             raise RuntimeError("x_search request did not return a response")
 
         data = response.json()
